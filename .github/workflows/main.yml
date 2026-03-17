@@ -9,12 +9,23 @@ permissions:
   contents: write
 
 jobs:
-  build-and-commit:
+  sync-build-and-commit:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/igareck/vpn-configs-for-russia.git
+          git fetch upstream
+
+      - name: Sync WHITE-CIDR-RU-checked.txt from upstream
+        run: |
+          git checkout upstream/main -- WHITE-CIDR-RU-checked.txt
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -32,7 +43,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add malfoy_subscription.txt malfoy_subscription_top20.txt checked_results.txt
+          git add WHITE-CIDR-RU-checked.txt
+          git add malfoy_subscription.txt
+          git add malfoy_subscription_top20.txt
+          git add checked_results.txt
 
           git diff --cached --quiet && echo "No changes to commit" && exit 0
 
