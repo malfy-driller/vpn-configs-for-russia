@@ -2,12 +2,10 @@ import os
 import requests
 import socket
 import time
-import base64
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 # =========================================================
 # 1. ИСТОЧНИК
-# Читаем файл ИЗ ТВОЕГО FORK
 # =========================================================
 
 URLS = [
@@ -29,10 +27,13 @@ PROTOCOLS = [
 MAX_CONNECT_MS = 800
 SOCKET_TIMEOUT = 3
 
+TOTAL_TOP_LIMIT = 20
+PER_COUNTRY_LIMIT = 2
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-OUTPUT_TXT_FILE = os.path.join(BASE_DIR, "malfoy_subscription.txt")
-OUTPUT_BASE64_FILE = os.path.join(BASE_DIR, "malfoy_subscription_base64.txt")
+OUTPUT_FULL_FILE = os.path.join(BASE_DIR, "malfoy_subscription.txt")
+OUTPUT_TOP20_FILE = os.path.join(BASE_DIR, "malfoy_subscription_top20.txt")
 DEBUG_RESULTS_FILE = os.path.join(BASE_DIR, "checked_results.txt")
 
 # =========================================================
@@ -44,7 +45,6 @@ def extract_configs(text):
 
     for line in text.splitlines():
         line = line.strip()
-
         if not line:
             continue
 
@@ -73,13 +73,11 @@ def extract_host_port(config):
 def check_tcp_connect(host, port, timeout=SOCKET_TIMEOUT):
     try:
         t1 = time.perf_counter()
-
         with socket.create_connection((host, port), timeout=timeout):
             t2 = time.perf_counter()
 
         latency_ms = int((t2 - t1) * 1000)
         return True, latency_ms
-
     except Exception:
         return False, None
 
@@ -91,6 +89,50 @@ def make_server_key(config):
     return f"{host}:{port}"
 
 
+def extract_label(config):
+    """
+    Возвращает подпись после #, если она есть.
+    """
+    if "#" not in config:
+        return ""
+    return unquote(config.split("#", 1)[1]).strip()
+
+
+def detect_country(config):
+    """
+    Очень простое определение страны по подписи конфига.
+    Берём первую часть до символа |, например:
+    '🇩🇪 Germany | [*CIDR] YA' -> 'Germany'
+    """
+    label = extract_label(config)
+    if not label:
+        return "Unknown"
+
+    first_part = label.split("|", 1)[0].strip()
+
+    # убираем эмодзи-флаг в начале, если есть
+    words = first_part.split()
+    if not words:
+        return "Unknown"
+
+    # если первая часть - флаг, страна будет после него
+    if len(words) >= 2:
+        country = " ".join(words[1:]).strip()
+    else:
+        country = words[0].strip()
+
+    if not country:
+        return "Unknown"
+
+    return country
+
+
+def save_configs_to_file(path, configs):
+    with open(path, "w", encoding="utf-8") as f:
+        for cfg in configs:
+            f.write(cfg + "\n")
+
+
 # =========================================================
 # 4. ОСНОВНАЯ ЛОГИКА
 # =========================================================
@@ -98,10 +140,11 @@ def make_server_key(config):
 def main():
     all_configs = []
 
-    print("=== Сборка подписки Malfoy ===")
+    print("=== Сборка подписок Malfoy ===")
     print(f"Источник: {URLS[0]}")
     print("==============================\n")
 
+    # 1. Загружаем исходный файл
     for url in URLS:
         try:
             print(f"[+] Загружаю: {url}")
@@ -113,24 +156,22 @@ def main():
 
             text = response.text
             configs = extract_configs(text)
-
             print(f"    найдено конфигов: {len(configs)}")
             all_configs.extend(configs)
 
         except Exception as e:
             print(f"[!] Ошибка при загрузке {url}: {e}")
 
-    # Убираем полные дубли строк
+    # 2. Убираем полные дубли
     unique_configs = sorted(set(all_configs))
-
     print(f"\n[=] Уникальных строк после удаления дублей: {len(unique_configs)}")
 
+    # 3. Проверяем TCP и фильтруем по времени
     checked_rows = []
     passed_configs = []
     skipped_configs = 0
 
     print("\n[=] Начинаю проверку TCP-доступности...\n")
-
     total = len(unique_configs)
 
     for i, cfg in enumerate(unique_configs, start=1):
@@ -156,7 +197,7 @@ def main():
             checked_rows.append((cfg, host, port, "FAIL"))
             print(f"[{i}/{total}] FAIL {host}:{port}")
 
-    # Ужатие по host:port — оставляем лучший конфиг на один сервер
+    # 4. Ужатие по host:port — оставляем лучший конфиг на один сервер
     best_by_server = {}
 
     for cfg, latency_ms in passed_configs:
@@ -171,36 +212,48 @@ def main():
             if latency_ms < old_latency:
                 best_by_server[server_key] = (cfg, latency_ms)
 
+    # Полная подписка
     final_pairs = list(best_by_server.values())
-    final_pairs.sort(key=lambda x: x[1])
+    final_pairs.sort(key=lambda x: x[1])  # по latency
+    full_configs = [cfg for cfg, _ in final_pairs]
 
-    final_configs = [cfg for cfg, _ in final_pairs]
+    # 5. Формируем top20 с ограничением на страну
+    country_counts = {}
+    top20_configs = []
 
-    # Обычный txt
-    with open(OUTPUT_TXT_FILE, "w", encoding="utf-8") as f:
-        for cfg in final_configs:
-            f.write(cfg + "\n")
+    for cfg, latency_ms in final_pairs:
+        country = detect_country(cfg)
 
-    # base64-версия
-    joined_text = "\n".join(final_configs)
-    encoded_text = base64.b64encode(joined_text.encode("utf-8")).decode("utf-8")
+        if country not in country_counts:
+            country_counts[country] = 0
 
-    with open(OUTPUT_BASE64_FILE, "w", encoding="utf-8") as f:
-        f.write(encoded_text)
+        if country_counts[country] >= PER_COUNTRY_LIMIT:
+            continue
 
-    # Подробный лог
+        top20_configs.append(cfg)
+        country_counts[country] += 1
+
+        if len(top20_configs) >= TOTAL_TOP_LIMIT:
+            break
+
+    # 6. Сохраняем файлы
+    save_configs_to_file(OUTPUT_FULL_FILE, full_configs)
+    save_configs_to_file(OUTPUT_TOP20_FILE, top20_configs)
+
     with open(DEBUG_RESULTS_FILE, "w", encoding="utf-8") as f:
         for cfg, host, port, status in checked_rows:
             f.write(f"{status} | {host}:{port} | {cfg}\n")
 
+    # 7. Вывод
     print("\n==============================")
     print(f"Всего уникальных строк: {len(unique_configs)}")
     print(f"Пропущено (не распарсились): {skipped_configs}")
     print(f"Прошли TCP-фильтр <= {MAX_CONNECT_MS} ms: {len(passed_configs)}")
-    print(f"Уникальных серверов после ужатия host:port: {len(final_configs)}")
-    print(f"TXT сохранён сюда: {OUTPUT_TXT_FILE}")
-    print(f"Base64 сохранён сюда: {OUTPUT_BASE64_FILE}")
-    print(f"Лог сохранён сюда: {DEBUG_RESULTS_FILE}")
+    print(f"Уникальных серверов после ужатия host:port: {len(full_configs)}")
+    print(f"Top-20 после ограничения {PER_COUNTRY_LIMIT} на страну: {len(top20_configs)}")
+    print(f"Полная подписка: {OUTPUT_FULL_FILE}")
+    print(f"Top-20 подписка: {OUTPUT_TOP20_FILE}")
+    print(f"Лог проверок: {DEBUG_RESULTS_FILE}")
     print("==============================")
 
 
