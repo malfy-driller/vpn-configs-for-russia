@@ -27,13 +27,34 @@ PROTOCOLS = [
 MAX_CONNECT_MS = 800
 SOCKET_TIMEOUT = 3
 
-TOTAL_TOP_LIMIT = 20
+TOTAL_TOP_LIMIT = 30
 PER_COUNTRY_LIMIT = 2
+ANYCAST_LIMIT = 4
+
+PRIORITY_COUNTRIES = [
+    "Belarus",
+    "Estonia",
+    "Finland",
+    "France",
+    "Germany",
+    "India",
+    "Japan",
+    "Kazakhstan",
+    "Lithuania",
+    "Poland",
+    "Russia",
+    "Sweden",
+    "Switzerland",
+    "Netherlands",
+    "Turkey",
+    "United States",
+    "Anycast-IP",
+]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 OUTPUT_FULL_FILE = os.path.join(BASE_DIR, "malfoy_subscription.txt")
-OUTPUT_TOP20_FILE = os.path.join(BASE_DIR, "malfoy_subscription_top20.txt")
+OUTPUT_TOP_FILE = os.path.join(BASE_DIR, "malfoy_subscription_top.txt")
 DEBUG_RESULTS_FILE = os.path.join(BASE_DIR, "checked_results.txt")
 
 # =========================================================
@@ -90,9 +111,6 @@ def make_server_key(config):
 
 
 def extract_label(config):
-    """
-    Возвращает подпись после #, если она есть.
-    """
     if "#" not in config:
         return ""
     return unquote(config.split("#", 1)[1]).strip()
@@ -100,9 +118,10 @@ def extract_label(config):
 
 def detect_country(config):
     """
-    Очень простое определение страны по подписи конфига.
-    Берём первую часть до символа |, например:
-    '🇩🇪 Germany | [*CIDR] YA' -> 'Germany'
+    Пытаемся вытащить страну из подписи конфига.
+    Примеры:
+    '🇩🇪 Germany | [*CIDR] YA' -> Germany
+    '🌐 Anycast-IP | [*CIDR] VK' -> Anycast-IP
     """
     label = extract_label(config)
     if not label:
@@ -110,12 +129,13 @@ def detect_country(config):
 
     first_part = label.split("|", 1)[0].strip()
 
-    # убираем эмодзи-флаг в начале, если есть
+    if "Anycast-IP" in first_part:
+        return "Anycast-IP"
+
     words = first_part.split()
     if not words:
         return "Unknown"
 
-    # если первая часть - флаг, страна будет после него
     if len(words) >= 2:
         country = " ".join(words[1:]).strip()
     else:
@@ -131,6 +151,12 @@ def save_configs_to_file(path, configs):
     with open(path, "w", encoding="utf-8") as f:
         for cfg in configs:
             f.write(cfg + "\n")
+
+
+def get_country_limit(country_name):
+    if country_name == "Anycast-IP":
+        return ANYCAST_LIMIT
+    return PER_COUNTRY_LIMIT
 
 
 # =========================================================
@@ -162,7 +188,7 @@ def main():
         except Exception as e:
             print(f"[!] Ошибка при загрузке {url}: {e}")
 
-    # 2. Убираем полные дубли
+    # 2. Убираем полные дубли строк
     unique_configs = sorted(set(all_configs))
     print(f"\n[=] Уникальных строк после удаления дублей: {len(unique_configs)}")
 
@@ -212,33 +238,77 @@ def main():
             if latency_ms < old_latency:
                 best_by_server[server_key] = (cfg, latency_ms)
 
-    # Полная подписка
     final_pairs = list(best_by_server.values())
     final_pairs.sort(key=lambda x: x[1])  # по latency
+
+    # Полная подписка
     full_configs = [cfg for cfg, _ in final_pairs]
 
-    # 5. Формируем top20 с ограничением на страну
-    country_counts = {}
-    top20_configs = []
+    # 5. Формируем top-list с приоритетом стран
+    country_buckets = {}
 
     for cfg, latency_ms in final_pairs:
         country = detect_country(cfg)
 
-        if country not in country_counts:
-            country_counts[country] = 0
+        if country not in country_buckets:
+            country_buckets[country] = []
 
-        if country_counts[country] >= PER_COUNTRY_LIMIT:
+        country_buckets[country].append((cfg, latency_ms))
+
+    for country in country_buckets:
+        country_buckets[country].sort(key=lambda x: x[1])
+
+    top_configs = []
+    country_counts = {}
+
+    # Сначала приоритетные страны
+    for country in PRIORITY_COUNTRIES:
+        if country not in country_buckets:
             continue
 
-        top20_configs.append(cfg)
-        country_counts[country] += 1
+        for cfg, latency_ms in country_buckets[country]:
+            if country not in country_counts:
+                country_counts[country] = 0
 
-        if len(top20_configs) >= TOTAL_TOP_LIMIT:
+            country_limit = get_country_limit(country)
+
+            if country_counts[country] >= country_limit:
+                break
+
+            top_configs.append(cfg)
+            country_counts[country] += 1
+
+            if len(top_configs) >= TOTAL_TOP_LIMIT:
+                break
+
+        if len(top_configs) >= TOTAL_TOP_LIMIT:
             break
+
+    # Потом добиваем остальными лучшими
+    if len(top_configs) < TOTAL_TOP_LIMIT:
+        for cfg, latency_ms in final_pairs:
+            if cfg in top_configs:
+                continue
+
+            country = detect_country(cfg)
+
+            if country not in country_counts:
+                country_counts[country] = 0
+
+            country_limit = get_country_limit(country)
+
+            if country_counts[country] >= country_limit:
+                continue
+
+            top_configs.append(cfg)
+            country_counts[country] += 1
+
+            if len(top_configs) >= TOTAL_TOP_LIMIT:
+                break
 
     # 6. Сохраняем файлы
     save_configs_to_file(OUTPUT_FULL_FILE, full_configs)
-    save_configs_to_file(OUTPUT_TOP20_FILE, top20_configs)
+    save_configs_to_file(OUTPUT_TOP_FILE, top_configs)
 
     with open(DEBUG_RESULTS_FILE, "w", encoding="utf-8") as f:
         for cfg, host, port, status in checked_rows:
@@ -250,9 +320,9 @@ def main():
     print(f"Пропущено (не распарсились): {skipped_configs}")
     print(f"Прошли TCP-фильтр <= {MAX_CONNECT_MS} ms: {len(passed_configs)}")
     print(f"Уникальных серверов после ужатия host:port: {len(full_configs)}")
-    print(f"Top-20 после ограничения {PER_COUNTRY_LIMIT} на страну: {len(top20_configs)}")
+    print(f"Top-list после фильтра по странам: {len(top_configs)}")
     print(f"Полная подписка: {OUTPUT_FULL_FILE}")
-    print(f"Top-20 подписка: {OUTPUT_TOP20_FILE}")
+    print(f"Top-подписка: {OUTPUT_TOP_FILE}")
     print(f"Лог проверок: {DEBUG_RESULTS_FILE}")
     print("==============================")
 
