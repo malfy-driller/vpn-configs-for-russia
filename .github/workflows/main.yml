@@ -3,7 +3,7 @@ name: Update White Lists Subscriptions
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "0 */2 * * *"
 
 permissions:
   contents: write
@@ -20,13 +20,25 @@ jobs:
 
       - name: Add upstream remote
         run: |
+          git remote remove upstream || true
           git remote add upstream https://github.com/igareck/vpn-configs-for-russia.git
           git fetch upstream
 
       - name: Sync source files from upstream
         run: |
           git checkout upstream/main -- WHITE-CIDR-RU-checked.txt
-          git checkout upstream/main -- WHITE-SNI-RU-all.txt
+          git checkout upstream/main -- Vless-Reality-White-Lists-Rus-Mobile.txt
+
+      - name: Remove obsolete files from repository
+        run: |
+          git rm -f WHITE-SNI-RU-all.txt || true
+          git rm -f white_sni_best.txt || true
+          git rm -f white_cidr_checked_full.txt || true
+          git rm -f white_cidr_checked_best.txt || true
+          git rm -f malfoy_subscription.txt || true
+          git rm -f malfoy_subscription_top.txt || true
+          git rm -f malfoy_subscription_top20.txt || true
+          git rm -f malfoy_subscription_base64.txt || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -45,10 +57,9 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add WHITE-CIDR-RU-checked.txt
-          git add WHITE-SNI-RU-all.txt
-          git add white_cidr_checked_full.txt
-          git add white_cidr_checked_best.txt
-          git add white_sni_best.txt
+          git add Vless-Reality-White-Lists-Rus-Mobile.txt
+          git add white_lists_full.txt
+          git add white_lists_best.txt
           git add checked_results.txt
 
           git diff --cached --quiet && echo "No changes to commit" && exit 0
