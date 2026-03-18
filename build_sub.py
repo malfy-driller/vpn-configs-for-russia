@@ -1,8 +1,7 @@
 import os
-import requests
 import socket
 import time
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
 from datetime import datetime, timezone, timedelta
 
 # =========================================================
@@ -16,8 +15,16 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Эти файлы workflow подтягивает из upstream перед запуском
 # =========================================================
 
-CIDR_SOURCE_FILE = os.path.join(BASE_DIR, "WHITE-CIDR-RU-checked.txt")
-SNI_SOURCE_FILE = os.path.join(BASE_DIR, "WHITE-SNI-RU-all.txt")
+SOURCE_FILES = [
+    {
+        "name": "CIDR-CHECKED",
+        "path": os.path.join(BASE_DIR, "WHITE-CIDR-RU-checked.txt"),
+    },
+    {
+        "name": "REALITY-MOBILE-1",
+        "path": os.path.join(BASE_DIR, "Vless-Reality-White-Lists-Rus-Mobile.txt"),
+    },
+]
 
 # =========================================================
 # 3. НАСТРОЙКИ
@@ -28,18 +35,23 @@ PROTOCOLS = [
     "vmess://",
     "ss://",
     "trojan://",
-    "hysteria2://"
+    "hysteria2://",
 ]
 
 MAX_CONNECT_MS = 800
 SOCKET_TIMEOUT = 3
 
-CIDR_BEST_TOTAL_LIMIT = 30
-CIDR_BEST_PER_COUNTRY_LIMIT = 2
-CIDR_BEST_ANYCAST_LIMIT = 4
+# FULL
+FULL_TOTAL_LIMIT = 150
+FULL_COUNTRY_LIMIT = 8
+FULL_BACKEND_LIMIT = 3
+FULL_ANYCAST_LIMIT = 10
 
-SNI_BEST_TOTAL_LIMIT = 5
-SNI_BEST_PER_COUNTRY_LIMIT = 1
+# BEST
+BEST_TOTAL_LIMIT = 80
+BEST_COUNTRY_LIMIT = 4
+BEST_BACKEND_LIMIT = 2
+BEST_ANYCAST_LIMIT = 6
 
 PRIORITY_COUNTRIES = [
     "Anycast-IP",
@@ -62,15 +74,12 @@ PRIORITY_COUNTRIES = [
     "United States",
 ]
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-OUTPUT_CIDR_FULL_FILE = os.path.join(BASE_DIR, "white_cidr_checked_full.txt")
-OUTPUT_CIDR_BEST_FILE = os.path.join(BASE_DIR, "white_cidr_checked_best.txt")
-OUTPUT_SNI_BEST_FILE = os.path.join(BASE_DIR, "white_sni_best.txt")
+OUTPUT_FULL_FILE = os.path.join(BASE_DIR, "white_lists_full.txt")
+OUTPUT_BEST_FILE = os.path.join(BASE_DIR, "white_lists_best.txt")
 DEBUG_RESULTS_FILE = os.path.join(BASE_DIR, "checked_results.txt")
 
 # =========================================================
-# 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# 4. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # =========================================================
 
 def extract_configs(text):
@@ -119,13 +128,6 @@ def check_tcp_connect(host, port, timeout=SOCKET_TIMEOUT):
         return False, None
 
 
-def make_server_key(config):
-    host, port = extract_host_port(config)
-    if not host or not port:
-        return None
-    return f"{host}:{port}"
-
-
 def extract_label(config):
     if "#" not in config:
         return ""
@@ -152,7 +154,7 @@ def detect_country(config):
     if not words:
         return "Unknown"
 
-    # обычно первый токен — эмодзи, дальше страна
+    # Обычно первый токен — эмодзи, дальше страна
     if len(words) >= 2:
         country = " ".join(words[1:]).strip()
     else:
@@ -169,13 +171,24 @@ def detect_country(config):
     return replacements.get(country, country)
 
 
+def sort_configs_alphabetically_by_country(configs):
+    return sorted(
+        configs,
+        key=lambda cfg: (
+            detect_country(cfg).lower(),
+            extract_label(cfg).lower(),
+            cfg.lower(),
+        )
+    )
+
+
 def get_moscow_time_str():
     moscow_tz = timezone(timedelta(hours=3))
     now = datetime.now(moscow_tz)
     return now.strftime("%Y-%m-%d / %H:%M"), "Moscow"
 
 
-def build_profile_header(title, count, description, update_interval=30):
+def build_profile_header(title, count, description, update_interval=120):
     dt_str, tz_name = get_moscow_time_str()
 
     header_lines = [
@@ -189,18 +202,7 @@ def build_profile_header(title, count, description, update_interval=30):
     return "\n".join(header_lines)
 
 
-def sort_configs_alphabetically_by_country(configs):
-    return sorted(
-        configs,
-        key=lambda cfg: (
-            detect_country(cfg).lower(),
-            extract_label(cfg).lower(),
-            cfg.lower()
-        )
-    )
-
-
-def save_configs_to_file(path, configs, title, description, update_interval=30):
+def save_configs_to_file(path, configs, title, description, update_interval=120):
     header = build_profile_header(
         title=title,
         count=len(configs),
@@ -214,25 +216,165 @@ def save_configs_to_file(path, configs, title, description, update_interval=30):
             f.write(cfg + "\n")
 
 
-def get_cidr_country_limit(country_name):
-    if country_name == "Anycast-IP":
-        return CIDR_BEST_ANYCAST_LIMIT
-    return CIDR_BEST_PER_COUNTRY_LIMIT
+def get_country_limit(country_name, mode):
+    if mode == "full":
+        if country_name == "Anycast-IP":
+            return FULL_ANYCAST_LIMIT
+        return FULL_COUNTRY_LIMIT
+
+    if mode == "best":
+        if country_name == "Anycast-IP":
+            return BEST_ANYCAST_LIMIT
+        return BEST_COUNTRY_LIMIT
+
+    raise ValueError(f"Unknown mode: {mode}")
 
 
-def build_country_limited_list(
-    pairs,
-    total_limit,
-    per_country_limit,
-    priority_countries=None,
-    special_limit_func=None
-):
+def get_backend_limit(mode):
+    if mode == "full":
+        return FULL_BACKEND_LIMIT
+    if mode == "best":
+        return BEST_BACKEND_LIMIT
+    raise ValueError(f"Unknown mode: {mode}")
+
+
+def build_backend_family_key(config):
     """
-    pairs: list[(cfg, latency_ms)] уже отсортированы по latency
+    Пытаемся сгруппировать "почти одинаковые" узлы.
+    Приоритет:
+    1) pbk + sid + sni
+    2) pbk + sni
+    3) host + sni
+    4) host
     """
-    if priority_countries is None:
-        priority_countries = []
+    try:
+        parsed = urlparse(config)
+        host = parsed.hostname or "unknown-host"
+        query = parse_qs(parsed.query)
 
+        def q(name):
+            values = query.get(name)
+            if not values:
+                return ""
+            return values[0].strip()
+
+        pbk = q("pbk")
+        sid = q("sid")
+        sni = q("sni")
+        security = q("security")
+
+        if pbk and sid and sni:
+            return f"reality|{pbk}|{sid}|{sni}"
+
+        if pbk and sni:
+            return f"reality|{pbk}|{sni}"
+
+        if host and sni:
+            return f"hostsni|{host}|{sni}"
+
+        return f"host|{host}|{security}"
+    except Exception:
+        return f"fallback|{config}"
+
+
+def load_all_sources():
+    all_configs = []
+    source_map = {}
+
+    for source in SOURCE_FILES:
+        source_name = source["name"]
+        file_path = source["path"]
+
+        print(f"=== Источник: {source_name} ===")
+        print(f"FILE: {file_path}")
+
+        if not os.path.exists(file_path):
+            raise RuntimeError(f"Файл не найден: {file_path}")
+
+        with open(file_path, "r", encoding="utf-8") as f:
+            text = f.read()
+
+        configs = extract_configs(text)
+        print(f"[+] Найдено конфигов: {len(configs)}\n")
+
+        for cfg in configs:
+            all_configs.append(cfg)
+            source_map.setdefault(cfg, set()).add(source_name)
+
+    unique_configs = sorted(set(all_configs))
+    return unique_configs, source_map
+
+
+def tcp_prefilter(unique_configs, source_map):
+    checked_rows = []
+    passed_pairs = []
+    skipped_configs = 0
+
+    print(f"[=] Уникальных строк после удаления дублей: {len(unique_configs)}")
+    print("\n[=] Начинаю TCP pre-filter...\n")
+
+    total = len(unique_configs)
+
+    for i, cfg in enumerate(unique_configs, start=1):
+        host, port = extract_host_port(cfg)
+        source_names = ",".join(sorted(source_map.get(cfg, {"unknown"})))
+
+        if not host or not port:
+            skipped_configs += 1
+            checked_rows.append((source_names, cfg, None, None, "SKIP"))
+            print(f"[{i}/{total}] SKIP не удалось вытащить host/port")
+            continue
+
+        ok, latency_ms = check_tcp_connect(host, port)
+
+        if ok and latency_ms is not None:
+            if latency_ms <= MAX_CONNECT_MS:
+                passed_pairs.append((cfg, latency_ms))
+                checked_rows.append((source_names, cfg, host, port, f"OK {latency_ms} ms"))
+                print(f"[{i}/{total}] OK   {host}:{port}  {latency_ms} ms")
+            else:
+                checked_rows.append((source_names, cfg, host, port, f"SLOW {latency_ms} ms"))
+                print(f"[{i}/{total}] SLOW {host}:{port}  {latency_ms} ms")
+        else:
+            checked_rows.append((source_names, cfg, host, port, "FAIL"))
+            print(f"[{i}/{total}] FAIL {host}:{port}")
+
+    return passed_pairs, checked_rows, skipped_configs
+
+
+def dedup_by_host_port(pairs):
+    """
+    Оставляем лучший по latency на один host:port
+    """
+    best_by_host_port = {}
+
+    for cfg, latency_ms in pairs:
+        host, port = extract_host_port(cfg)
+        if not host or not port:
+            continue
+
+        key = f"{host}:{port}"
+
+        if key not in best_by_host_port:
+            best_by_host_port[key] = (cfg, latency_ms)
+        else:
+            old_cfg, old_latency = best_by_host_port[key]
+            if latency_ms < old_latency:
+                best_by_host_port[key] = (cfg, latency_ms)
+
+    result = list(best_by_host_port.values())
+    result.sort(key=lambda x: x[1])
+    return result
+
+
+def build_limited_list(pairs, total_limit, mode):
+    """
+    pairs уже отсортированы по latency
+    Применяем:
+    - лимит по стране
+    - лимит по backend family
+    - сначала приоритетные страны, потом остальные
+    """
     country_buckets = {}
 
     for cfg, latency_ms in pairs:
@@ -243,200 +385,112 @@ def build_country_limited_list(
         country_buckets[country].sort(key=lambda x: x[1])
 
     selected = []
+    selected_set = set()
     country_counts = {}
+    backend_counts = {}
 
-    def get_limit(country_name):
-        if special_limit_func:
-            return special_limit_func(country_name)
-        return per_country_limit
+    backend_limit = get_backend_limit(mode)
 
-    # 1. Сначала приоритетные страны
-    for country in priority_countries:
+    def try_add(cfg):
+        country = detect_country(cfg)
+        backend_key = build_backend_family_key(cfg)
+
+        country_counts.setdefault(country, 0)
+        backend_counts.setdefault(backend_key, 0)
+
+        if country_counts[country] >= get_country_limit(country, mode):
+            return False
+
+        if backend_counts[backend_key] >= backend_limit:
+            return False
+
+        selected.append(cfg)
+        selected_set.add(cfg)
+        country_counts[country] += 1
+        backend_counts[backend_key] += 1
+        return True
+
+    # 1. Приоритетные страны
+    for country in PRIORITY_COUNTRIES:
         if country not in country_buckets:
             continue
 
         for cfg, latency_ms in country_buckets[country]:
-            country_counts.setdefault(country, 0)
-
-            if country_counts[country] >= get_limit(country):
-                break
-
-            selected.append(cfg)
-            country_counts[country] += 1
-
-            if len(selected) >= total_limit:
+            added = try_add(cfg)
+            if added and len(selected) >= total_limit:
                 break
 
         if len(selected) >= total_limit:
             break
 
-    # 2. Потом добиваем оставшимися лучшими
+    # 2. Остальные по общему рейтингу (latency)
     if len(selected) < total_limit:
         for cfg, latency_ms in pairs:
-            if cfg in selected:
+            if cfg in selected_set:
                 continue
 
-            country = detect_country(cfg)
-            country_counts.setdefault(country, 0)
-
-            if country_counts[country] >= get_limit(country):
-                continue
-
-            selected.append(cfg)
-            country_counts[country] += 1
-
-            if len(selected) >= total_limit:
+            added = try_add(cfg)
+            if added and len(selected) >= total_limit:
                 break
 
     return sort_configs_alphabetically_by_country(selected)
 
 
-def process_source(source_name, file_path):
-    print(f"=== Обработка источника: {source_name} ===")
-    print(f"FILE: {file_path}\n")
-
-    all_configs = []
-
-    if not os.path.exists(file_path):
-        raise RuntimeError(f"Файл не найден: {file_path}")
-
-    with open(file_path, "r", encoding="utf-8") as f:
-        text = f.read()
-
-    configs = extract_configs(text)
-    print(f"[+] Найдено конфигов в {source_name}: {len(configs)}")
-    all_configs.extend(configs)
-
-    unique_configs = sorted(set(all_configs))
-    print(f"[=] Уникальных строк после удаления дублей: {len(unique_configs)}")
-
-    checked_rows = []
-    passed_configs = []
-    skipped_configs = 0
-
-    print(f"\n[=] Начинаю проверку TCP-доступности для {source_name}...\n")
-    total = len(unique_configs)
-
-    for i, cfg in enumerate(unique_configs, start=1):
-        host, port = extract_host_port(cfg)
-
-        if not host or not port:
-            skipped_configs += 1
-            checked_rows.append((source_name, cfg, None, None, "SKIP"))
-            print(f"[{i}/{total}] SKIP не удалось вытащить host/port")
-            continue
-
-        ok, latency_ms = check_tcp_connect(host, port)
-
-        if ok and latency_ms is not None:
-            if latency_ms <= MAX_CONNECT_MS:
-                passed_configs.append((cfg, latency_ms))
-                checked_rows.append((source_name, cfg, host, port, f"OK {latency_ms} ms"))
-                print(f"[{i}/{total}] OK   {host}:{port}  {latency_ms} ms")
-            else:
-                checked_rows.append((source_name, cfg, host, port, f"SLOW {latency_ms} ms"))
-                print(f"[{i}/{total}] SLOW {host}:{port}  {latency_ms} ms")
-        else:
-            checked_rows.append((source_name, cfg, host, port, "FAIL"))
-            print(f"[{i}/{total}] FAIL {host}:{port}")
-
-    best_by_server = {}
-
-    for cfg, latency_ms in passed_configs:
-        server_key = make_server_key(cfg)
-        if not server_key:
-            continue
-
-        if server_key not in best_by_server:
-            best_by_server[server_key] = (cfg, latency_ms)
-        else:
-            old_cfg, old_latency = best_by_server[server_key]
-            if latency_ms < old_latency:
-                best_by_server[server_key] = (cfg, latency_ms)
-
-    final_pairs = list(best_by_server.values())
-    final_pairs.sort(key=lambda x: x[1])
-
-    print(f"\n[=] После ужатия по host:port: {len(final_pairs)}")
-    print("========================================\n")
-
-    return {
-        "unique_count": len(unique_configs),
-        "skipped_count": skipped_configs,
-        "passed_count": len(passed_configs),
-        "final_pairs": final_pairs,
-        "checked_rows": checked_rows,
-    }
-
-
 # =========================================================
-# 4. ОСНОВНАЯ ЛОГИКА
+# 5. ОСНОВНАЯ ЛОГИКА
 # =========================================================
 
 def main():
-    # --- CIDR ---
-    cidr_result = process_source("WHITE-CIDR-RU-checked", CIDR_SOURCE_FILE)
-    cidr_final_pairs = cidr_result["final_pairs"]
+    unique_configs, source_map = load_all_sources()
 
-    cidr_full_configs = sort_configs_alphabetically_by_country(
-        [cfg for cfg, _ in cidr_final_pairs]
+    passed_pairs, checked_rows, skipped_configs = tcp_prefilter(unique_configs, source_map)
+
+    host_port_dedup_pairs = dedup_by_host_port(passed_pairs)
+
+    print("\n========================================")
+    print(f"После дедупа по host:port: {len(host_port_dedup_pairs)}")
+    print("========================================\n")
+
+    full_configs = build_limited_list(
+        pairs=host_port_dedup_pairs,
+        total_limit=FULL_TOTAL_LIMIT,
+        mode="full",
     )
 
-    cidr_best_configs = build_country_limited_list(
-        pairs=cidr_final_pairs,
-        total_limit=CIDR_BEST_TOTAL_LIMIT,
-        per_country_limit=CIDR_BEST_PER_COUNTRY_LIMIT,
-        priority_countries=PRIORITY_COUNTRIES,
-        special_limit_func=get_cidr_country_limit
-    )
-
-    # --- SNI ---
-    sni_result = process_source("WHITE-SNI-RU-all", SNI_SOURCE_FILE)
-    sni_final_pairs = sni_result["final_pairs"]
-
-    sni_best_configs = build_country_limited_list(
-        pairs=sni_final_pairs,
-        total_limit=SNI_BEST_TOTAL_LIMIT,
-        per_country_limit=SNI_BEST_PER_COUNTRY_LIMIT,
-        priority_countries=PRIORITY_COUNTRIES
-    )
-
-    # --- Сохранение файлов ---
-    save_configs_to_file(
-        OUTPUT_CIDR_FULL_FILE,
-        cidr_full_configs,
-        title="🏳️ БЕЛЫЕ СПИСКИ 🏳️ WHITE LISTS | CIDR | Только VK, Yandex, CDNvideo, Beeline",
-        description="Полный список после TCP-фильтра и ужатия по host:port, отсортирован по странам",
-        update_interval=30
+    best_configs = build_limited_list(
+        pairs=host_port_dedup_pairs,
+        total_limit=BEST_TOTAL_LIMIT,
+        mode="best",
     )
 
     save_configs_to_file(
-        OUTPUT_CIDR_BEST_FILE,
-        cidr_best_configs,
-        title="⚡ БЕЛЫЕ СПИСКИ ⚡ WHITE LISTS | CIDR | Лучшие сервера",
-        description="Отобранный список: до 2 серверов на страну, Anycast до 4, отсортирован по странам",
-        update_interval=30
+        OUTPUT_FULL_FILE,
+        full_configs,
+        title="🏳️ БЕЛЫЕ СПИСКИ 🏳️ WHITE LISTS | FULL | CIDR + MOBILE",
+        description="Собрано из WHITE-CIDR-RU-checked и Vless-Reality-White-Lists-Rus-Mobile. TCP pre-filter, лимит по странам и backend family.",
+        update_interval=120,
     )
 
     save_configs_to_file(
-        OUTPUT_SNI_BEST_FILE,
-        sni_best_configs,
-        title="📡 БЕЛЫЕ СПИСКИ 📡 WHITE LISTS | SNI",
-        description="Лучшие SNI-конфиги: до 5 серверов из разных стран, отсортированы по странам",
-        update_interval=30
+        OUTPUT_BEST_FILE,
+        best_configs,
+        title="⚡ БЕЛЫЕ СПИСКИ ⚡ WHITE LISTS | BEST | CIDR + MOBILE",
+        description="Отобранный список: до 80 конфигов, лимит по странам и backend family, отсортирован по странам.",
+        update_interval=120,
     )
-
-    all_checked_rows = cidr_result["checked_rows"] + sni_result["checked_rows"]
 
     with open(DEBUG_RESULTS_FILE, "w", encoding="utf-8") as f:
-        for source_name, cfg, host, port, status in all_checked_rows:
-            f.write(f"{source_name} | {status} | {host}:{port} | {cfg}\n")
+        for source_names, cfg, host, port, status in checked_rows:
+            f.write(f"{source_names} | {status} | {host}:{port} | {cfg}\n")
 
     print("\n==============================")
-    print(f"CIDR FULL: {len(cidr_full_configs)}")
-    print(f"CIDR BEST: {len(cidr_best_configs)}")
-    print(f"SNI BEST: {len(sni_best_configs)}")
-    print(f"Лог проверок: {DEBUG_RESULTS_FILE}")
+    print(f"Уникальных строк: {len(unique_configs)}")
+    print(f"Пропущено (не распарсились): {skipped_configs}")
+    print(f"Прошли TCP pre-filter: {len(passed_pairs)}")
+    print(f"После host:port дедупа: {len(host_port_dedup_pairs)}")
+    print(f"FULL: {len(full_configs)}")
+    print(f"BEST: {len(best_configs)}")
+    print(f"Лог: {DEBUG_RESULTS_FILE}")
     print("==============================")
 
 
