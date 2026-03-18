@@ -6,14 +6,21 @@ from urllib.parse import urlparse, unquote
 from datetime import datetime, timezone, timedelta
 
 # =========================================================
-# 1. ИСТОЧНИКИ
+# 1. БАЗОВАЯ ПАПКА
+# =========================================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# =========================================================
+# 2. ЛОКАЛЬНЫЕ ИСХОДНЫЕ ФАЙЛЫ
+# Эти файлы workflow подтягивает из upstream перед запуском
 # =========================================================
 
 CIDR_SOURCE_FILE = os.path.join(BASE_DIR, "WHITE-CIDR-RU-checked.txt")
 SNI_SOURCE_FILE = os.path.join(BASE_DIR, "WHITE-SNI-RU-all.txt")
 
 # =========================================================
-# 2. НАСТРОЙКИ
+# 3. НАСТРОЙКИ
 # =========================================================
 
 PROTOCOLS = [
