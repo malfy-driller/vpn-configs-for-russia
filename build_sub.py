@@ -9,8 +9,8 @@ from datetime import datetime, timezone, timedelta
 # 1. ИСТОЧНИКИ
 # =========================================================
 
-CIDR_URL = "https://raw.githubusercontent.com/malfy-driller/vpn-configs-for-russia/main/WHITE-CIDR-RU-checked.txt"
-SNI_URL = "https://raw.githubusercontent.com/malfy-driller/vpn-configs-for-russia/main/WHITE-SNI-RU-all.txt"
+CIDR_SOURCE_FILE = os.path.join(BASE_DIR, "WHITE-CIDR-RU-checked.txt")
+SNI_SOURCE_FILE = os.path.join(BASE_DIR, "WHITE-SNI-RU-all.txt")
 
 # =========================================================
 # 2. НАСТРОЙКИ
@@ -284,17 +284,18 @@ def build_country_limited_list(
     return sort_configs_alphabetically_by_country(selected)
 
 
-def process_source(source_name, url):
+def process_source(source_name, file_path):
     print(f"=== Обработка источника: {source_name} ===")
-    print(f"URL: {url}\n")
+    print(f"FILE: {file_path}\n")
 
     all_configs = []
 
-    response = requests.get(url, timeout=20)
-    if response.status_code != 200:
-        raise RuntimeError(f"Не удалось загрузить {source_name}. Код ответа: {response.status_code}")
+    if not os.path.exists(file_path):
+        raise RuntimeError(f"Файл не найден: {file_path}")
 
-    text = response.text
+    with open(file_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
     configs = extract_configs(text)
     print(f"[+] Найдено конфигов в {source_name}: {len(configs)}")
     all_configs.extend(configs)
@@ -332,7 +333,6 @@ def process_source(source_name, url):
             checked_rows.append((source_name, cfg, host, port, "FAIL"))
             print(f"[{i}/{total}] FAIL {host}:{port}")
 
-    # Ужатие по host:port — оставляем лучший конфиг на один сервер
     best_by_server = {}
 
     for cfg, latency_ms in passed_configs:
@@ -368,7 +368,7 @@ def process_source(source_name, url):
 
 def main():
     # --- CIDR ---
-    cidr_result = process_source("WHITE-CIDR-RU-checked", CIDR_URL)
+    cidr_result = process_source("WHITE-CIDR-RU-checked", CIDR_SOURCE_FILE)
     cidr_final_pairs = cidr_result["final_pairs"]
 
     cidr_full_configs = sort_configs_alphabetically_by_country(
@@ -384,7 +384,7 @@ def main():
     )
 
     # --- SNI ---
-    sni_result = process_source("WHITE-SNI-RU-all", SNI_URL)
+    sni_result = process_source("WHITE-SNI-RU-all", SNI_SOURCE_FILE)
     sni_final_pairs = sni_result["final_pairs"]
 
     sni_best_configs = build_country_limited_list(
