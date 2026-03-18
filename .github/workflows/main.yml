@@ -38,7 +38,7 @@ jobs:
       - name: Run subscription builder
         run: python build_sub.py
 
-            - name: Commit and push updated files
+      - name: Commit and push updated files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
