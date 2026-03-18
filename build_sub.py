@@ -74,8 +74,19 @@ PRIORITY_COUNTRIES = [
     "United States",
 ]
 
-OUTPUT_FULL_FILE = os.path.join(BASE_DIR, "white_lists_full.txt")
-OUTPUT_BEST_FILE = os.path.join(BASE_DIR, "white_lists_best.txt")
+PREFERRED_SERVER_NAMES = [
+    "ads.x5.ru",
+    "max.ru",
+    "disk.yandex.ru",
+    "eh.vk.com",
+    "api-maps.yandex.ru",
+    "rutube.ru",
+    "vk.com",
+    "ipa.market.yandex.ru",
+]
+
+OUTPUT_FULL_FILE = os.path.join(BASE_DIR, "wl_full.txt")
+OUTPUT_BEST_FILE = os.path.join(BASE_DIR, "wl_best.txt")
 DEBUG_RESULTS_FILE = os.path.join(BASE_DIR, "checked_results.txt")
 
 # =========================================================
@@ -116,6 +127,40 @@ def extract_host_port(config):
         return None, None
 
 
+def extract_label(config):
+    if "#" not in config:
+        return ""
+    return unquote(config.split("#", 1)[1]).strip()
+
+
+def extract_query_value(config, key):
+    try:
+        parsed = urlparse(config)
+        query = parse_qs(parsed.query)
+        values = query.get(key)
+        if not values:
+            return ""
+        return values[0].strip()
+    except Exception:
+        return ""
+
+
+def extract_server_name(config):
+    """
+    Пытаемся вытащить serverName/sni.
+    """
+    sni = extract_query_value(config, "sni")
+    if sni:
+        return sni.lower()
+
+    host = extract_query_value(config, "host")
+    if host:
+        return host.lower()
+
+    host2, _ = extract_host_port(config)
+    return (host2 or "").lower()
+
+
 def check_tcp_connect(host, port, timeout=SOCKET_TIMEOUT):
     try:
         t1 = time.perf_counter()
@@ -126,12 +171,6 @@ def check_tcp_connect(host, port, timeout=SOCKET_TIMEOUT):
         return True, latency_ms
     except Exception:
         return False, None
-
-
-def extract_label(config):
-    if "#" not in config:
-        return ""
-    return unquote(config.split("#", 1)[1]).strip()
 
 
 def detect_country(config):
@@ -154,7 +193,6 @@ def detect_country(config):
     if not words:
         return "Unknown"
 
-    # Обычно первый токен — эмодзи, дальше страна
     if len(words) >= 2:
         country = " ".join(words[1:]).strip()
     else:
@@ -240,7 +278,7 @@ def get_backend_limit(mode):
 
 def build_backend_family_key(config):
     """
-    Пытаемся сгруппировать "почти одинаковые" узлы.
+    Группируем "почти одинаковые" узлы.
     Приоритет:
     1) pbk + sid + sni
     2) pbk + sni
@@ -275,6 +313,22 @@ def build_backend_family_key(config):
         return f"host|{host}|{security}"
     except Exception:
         return f"fallback|{config}"
+
+
+def has_preferred_server_name(config):
+    sni = extract_server_name(config)
+    if not sni:
+        return False
+    return any(pref in sni for pref in PREFERRED_SERVER_NAMES)
+
+
+def adjusted_rank(latency_ms, preferred):
+    """
+    Чем меньше значение, тем выше приоритет.
+    Предпочтительные serverName получают бонус.
+    """
+    bonus = 120 if preferred else 0
+    return max(0, latency_ms - bonus)
 
 
 def load_all_sources():
@@ -363,13 +417,13 @@ def dedup_by_host_port(pairs):
                 best_by_host_port[key] = (cfg, latency_ms)
 
     result = list(best_by_host_port.values())
-    result.sort(key=lambda x: x[1])
+    result.sort(key=lambda x: adjusted_rank(x[1], has_preferred_server_name(x[0])))
     return result
 
 
 def build_limited_list(pairs, total_limit, mode):
     """
-    pairs уже отсортированы по latency
+    pairs уже отсортированы по adjusted rank
     Применяем:
     - лимит по стране
     - лимит по backend family
@@ -382,7 +436,9 @@ def build_limited_list(pairs, total_limit, mode):
         country_buckets.setdefault(country, []).append((cfg, latency_ms))
 
     for country in country_buckets:
-        country_buckets[country].sort(key=lambda x: x[1])
+        country_buckets[country].sort(
+            key=lambda x: adjusted_rank(x[1], has_preferred_server_name(x[0]))
+        )
 
     selected = []
     selected_set = set()
@@ -410,7 +466,7 @@ def build_limited_list(pairs, total_limit, mode):
         backend_counts[backend_key] += 1
         return True
 
-    # 1. Приоритетные страны
+    # 1. Сначала приоритетные страны
     for country in PRIORITY_COUNTRIES:
         if country not in country_buckets:
             continue
@@ -423,7 +479,7 @@ def build_limited_list(pairs, total_limit, mode):
         if len(selected) >= total_limit:
             break
 
-    # 2. Остальные по общему рейтингу (latency)
+    # 2. Потом остальные по общему рейтингу
     if len(selected) < total_limit:
         for cfg, latency_ms in pairs:
             if cfg in selected_set:
@@ -466,16 +522,16 @@ def main():
     save_configs_to_file(
         OUTPUT_FULL_FILE,
         full_configs,
-        title="🏳️ БЕЛЫЕ СПИСКИ 🏳️ WHITE LISTS | FULL | CIDR + MOBILE",
-        description="Собрано из WHITE-CIDR-RU-checked и Vless-Reality-White-Lists-Rus-Mobile. TCP pre-filter, лимит по странам и backend family.",
+        title="📦 WL FULL | CIDR+MOB",
+        description="TCP pre-filter, дедуп по host:port и backend family, лимиты по странам, приоритет preferred serverName.",
         update_interval=120,
     )
 
     save_configs_to_file(
         OUTPUT_BEST_FILE,
         best_configs,
-        title="⚡ БЕЛЫЕ СПИСКИ ⚡ WHITE LISTS | BEST | CIDR + MOBILE",
-        description="Отобранный список: до 80 конфигов, лимит по странам и backend family, отсортирован по странам.",
+        title="⚡ WL BEST | CIDR+MOB",
+        description="До 80 конфигов, лимиты по странам и backend family, приоритет preferred serverName, отсортировано по странам.",
         update_interval=120,
     )
 
