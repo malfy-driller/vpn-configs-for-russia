@@ -1,4 +1,4 @@
-name: Update White Lists Subscriptions
+name: Update WL subscriptions
 
 on:
   workflow_dispatch:
@@ -35,6 +35,8 @@ jobs:
           git rm -f white_sni_best.txt || true
           git rm -f white_cidr_checked_full.txt || true
           git rm -f white_cidr_checked_best.txt || true
+          git rm -f white_lists_full.txt || true
+          git rm -f white_lists_best.txt || true
           git rm -f malfoy_subscription.txt || true
           git rm -f malfoy_subscription_top.txt || true
           git rm -f malfoy_subscription_top20.txt || true
@@ -58,11 +60,11 @@ jobs:
 
           git add WHITE-CIDR-RU-checked.txt
           git add Vless-Reality-White-Lists-Rus-Mobile.txt
-          git add white_lists_full.txt
-          git add white_lists_best.txt
+          git add wl_full.txt
+          git add wl_best.txt
           git add checked_results.txt
 
           git diff --cached --quiet && echo "No changes to commit" && exit 0
 
-          git commit -m "Auto-update white lists subscriptions"
+          git commit -m "Auto-update WL subscriptions"
           git push
